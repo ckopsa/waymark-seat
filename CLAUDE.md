@@ -15,5 +15,5 @@ The hook speaks to you one time, at your stop. It gives you the
 sitting's id and the token counts. Make that one call with those
 numbers, and then stop.
 
-A person keeps these files in the branch `main` of this repository,
-in the directory `seat/`. A workflow puts them here.
+The source of these files is the repository `ckopsa/waymark`, on its
+branch `main` under `seat/`. A workflow copies them here each hour.
