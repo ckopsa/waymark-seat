@@ -1,0 +1,97 @@
+# Mirrors the seat's place from ckopsa/waymark.
+#
+# WHY THIS EXISTS. A Claude Routine attaches a repository, not a
+# branch, so the sitter's session clones this repository. The three
+# files it holds have one source: ckopsa/waymark, which assembles and
+# checks them on each push to its main and publishes them as its
+# branch `seat` (.github/workflows/seat-place.yml there). This
+# workflow copies that branch into this repository's main.
+#
+# NO SECRET. ckopsa/waymark is public, so the checkout of its `seat`
+# branch needs no token, and this repository's own token writes its
+# own main. Nothing here can reach any other repository.
+#
+# THE COUNT IS CHECKED HERE TOO. The tree must hold the three files
+# and this workflow, and nothing else. A sitter's session reads
+# nothing but CLAUDE.md, and the point of this place is what it
+# does NOT carry.
+#
+# WHEN IT RUNS. Each hour, and by hand (workflow_dispatch). GitHub
+# stops a schedule after sixty days with no commit here; when the
+# hook changes after a quiet season, run this workflow by hand once.
+
+name: sync
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/sync.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ckopsa/waymark
+          ref: seat
+          path: upstream
+
+      - name: Copy the three files
+        run: |
+          set -euo pipefail
+          from="$(git -C upstream rev-parse HEAD)"
+          for f in CLAUDE.md .claude/settings.json .claude/hooks/sitting-close.sh; do
+            mkdir -p "$(dirname "$f")"
+            cp "upstream/$f" "$f"
+          done
+          chmod +x .claude/hooks/sitting-close.sh
+          rm -rf upstream
+          echo "from=$from" >> "$GITHUB_ENV"
+
+      - name: Check the tree
+        run: |
+          set -euo pipefail
+          held="$(find . -type f -not -path './.git/*' | sed 's|^\./||' | sort)"
+          want="$(printf '%s\n' \
+            '.claude/hooks/sitting-close.sh' \
+            '.claude/settings.json' \
+            '.github/workflows/sync.yml' \
+            'CLAUDE.md' | sort)"
+          if [ "$held" != "$want" ]; then
+            echo "::error::the seat's place must hold the three files and this workflow, and no other."
+            echo "it holds:"; printf '%s\n' "$held"
+            exit 1
+          fi
+          lines="$(wc -l < CLAUDE.md)"
+          if [ "$lines" -gt 20 ]; then
+            echo "::error::CLAUDE.md is ${lines} lines, and it must be 20 or fewer."
+            exit 1
+          fi
+          bash -n .claude/hooks/sitting-close.sh
+          python3 -m json.tool .claude/settings.json > /dev/null
+
+      - name: Commit when changed
+        run: |
+          set -euo pipefail
+          git add -A
+          if git diff --cached --quiet; then
+            echo "already equal to ckopsa/waymark seat @ ${from}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --quiet -m "seat: mirror of ckopsa/waymark seat @ ${from}"
+          git push origin HEAD:main
