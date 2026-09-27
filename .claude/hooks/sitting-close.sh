@@ -19,7 +19,9 @@
 # Two paths, as R-12.26 has them. When the environment carries the
 # door's URL, the hook posts. When it carries nothing — a cloud
 # environment that takes a repository and no settings — a FIRED session
-# is held one time and given its counts to close by hand, and an
+# closes its sitting with the transcript key its sit answered, and is
+# held one time and given its counts to close by hand only when that
+# close is refused. An
 # INTERACTIVE one is told once that a tally needs the URL and left
 # alone: a block on every turn would stop the person's work.
 set -u
@@ -286,7 +288,7 @@ def text_of(block):  # a tool result is a string, or blocks of text
     return body if isinstance(body, str) else ""
 
 totals, turns = dict.fromkeys(FIELDS, 0), 0
-sat, sitting, seat_mode, closed = set(), "", "", False
+sat, sitting, seat_mode, closed, transcript = set(), "", "", False, None
 for index, path in enumerate(paths):
     seen = set()
     try:
@@ -324,6 +326,15 @@ for index, path in enumerate(paths):
                         # an absent mode reads as the fired one
                         modes = re.findall(r'"mode"\s*:\s*"([^"]+)"', answer)
                         seat_mode = modes[-1] if modes else ""
+                        # and the transcript's address and key, which
+                        # also close this sitting (R-12.17)
+                        try:
+                            t = json.loads(answer).get("transcript")
+                        except Exception:
+                            t = None
+                        transcript = ((str(t["url"]), str(t["key"]))
+                                      if isinstance(t, dict) and t.get("url") and t.get("key")
+                                      else None)
             if record.get("type") != "assistant":
                 continue
             # One API response is several lines, one for each content
@@ -343,12 +354,23 @@ count = tuple(totals[field] for field in FIELDS)
 # the status line, first and always: what the shell has to know about
 # this session before it decides which door to knock on
 sys.stdout.write("%s|%s|%d\n" % (seat_mode, sitting, 1 if closed else 0))
+report = {"input_tokens": count[0], "output_tokens": count[1],
+          "cache_read_tokens": count[2], "cache_write_tokens": count[3],
+          "turns": turns, "harness_session": session[:128],
+          "note": ("Reported by the hook after %d turns." % turns)[:240]}
 if MODE == "post":
-    json.dump({"input_tokens": count[0], "output_tokens": count[1],
-               "cache_read_tokens": count[2], "cache_write_tokens": count[3],
-               "turns": turns, "harness_session": session,
-               "note": ("Reported by the hook after %d turns." % turns)[:240]},
-              sys.stdout)
+    json.dump(report, sys.stdout)
+    sys.exit(0)
+
+# "direct": the close door, the transcript key and the body, one line
+# each, when this sitting is open and the sit answered a transcript
+# whose address ends in /transcript; the status line alone otherwise.
+if MODE == "direct":
+    if sitting and not closed and not hook.get("stop_hook_active") \
+            and transcript and re.search(r"/transcript/?$", transcript[0]):
+        sys.stdout.write(re.sub(r"/transcript/?$", "/close", transcript[0]) + "\n")
+        sys.stdout.write(transcript[1] + "\n")
+        json.dump(report, sys.stdout)
     sys.exit(0)
 
 # Say nothing unless a sitting is open, no close is in the transcript,
@@ -475,8 +497,37 @@ if [ "$MODE" = "interactive" ]; then
   exit 0
 fi
 
+# A fired run closes its own sitting (R-12.17): the sit answered the
+# transcript's address and key, the key also opens the close beside it,
+# and the transcript went up above. A 2xx means the bill is in and the
+# stop is not held; anything else falls back to the hold below, once.
+direct_close() {
+  local out url rest key body reply status
+  out=$(printf '%s' "$HOOK" | python3 -c "$SUM" direct 2>/dev/null) || return 1
+  case "$out" in
+    *$'\n'*$'\n'*$'\n'*) out=${out#*$'\n'} ;;
+    *) return 1 ;;
+  esac
+  url=${out%%$'\n'*}
+  rest=${out#*$'\n'}
+  key=${rest%%$'\n'*}
+  body=${rest#*$'\n'}
+  [ -n "$url" ] && [ -n "$key" ] && [ -n "$body" ] || return 1
+  reply=$(curl -sS --max-time 20 -X POST -H 'Content-Type: application/json' \
+    -H "Waymark-Transcript-Key: ${key}" -d "$body" -w '\n%{http_code}' "$url" 2>&1)
+  status=${reply##*$'\n'}
+  case "$status" in
+    2??) return 0 ;;
+  esac
+  echo "waymark: the close by the transcript key was answered ${status}; holding the stop." >&2
+  return 1
+}
+
 # Hold the stop one time and hand the session the id and the counts. A
 # session that never sat gets nothing: the hook rides in every waymark
 # cloud session.
-[ -n "$REPLY" ] && printf '%s\n' "$REPLY"
+if [ -n "$REPLY" ]; then
+  direct_close && exit 0
+  printf '%s\n' "$REPLY"
+fi
 exit 0
