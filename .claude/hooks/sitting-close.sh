@@ -28,6 +28,231 @@ EVENT="${1:-stop}"
 
 HOOK=$(cat)   # the hook's JSON, on stdin. Both paths read it.
 
+# THE TRANSCRIPT GOES FIRST (docs/spec-transcript.md § 6). The sit
+# answers an address and a key for this sitting's transcript, beside the
+# sitting's id; the program below finds the last such answer, redacts
+# every line, and appends what the engine does not hold yet, chained.
+# It runs on every Stop and on SessionEnd, the second Stop of a fired
+# run included: that one comes after the close, and it carries the last
+# lines. It prints nothing on stdout (the harness reads stdout as the
+# hook's decision), it spends at most 20 seconds, and nothing it meets
+# fails the session: a refusal or a dark network is one line on stderr,
+# and the close below runs as it always did.
+read -r -d '' UPLOAD <<'PY'
+import glob, gzip, hashlib, json, os, re, subprocess, sys, tempfile, time
+
+START = time.time()
+BUDGET = 20.0
+POST_BYTES = 2 * 1024 * 1024   # under the door's 4 MiB, JSON escaping included
+ZERO = "0" * 64
+
+def say(msg):
+    sys.stderr.write("waymark: the transcript upload " + msg + "\n")
+
+try:
+    hook = json.loads(sys.stdin.read() or "{}")
+except Exception:
+    hook = {}
+session = str(hook.get("session_id") or "")
+main = str(hook.get("transcript_path") or "")
+if not main or not os.path.isfile(main):
+    sys.exit(0)
+
+def read_lines(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as h:
+            text = h.read()
+    except OSError:
+        return []
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+def text_of(block):
+    body = block.get("content")
+    if isinstance(body, list):
+        return " ".join(p.get("text") or "" for p in body if isinstance(p, dict))
+    return body if isinstance(body, str) else ""
+
+main_lines = read_lines(main)
+
+# The sit answers {"sitting": …, "transcript": {"url": …, "key": …}}.
+# The LAST such answer is the live one: a second sit mints a new key.
+sat, found, seat_keys, transcript_keys = set(), None, set(), set()
+for line in main_lines:
+    try:
+        rec = json.loads(line)
+    except Exception:
+        continue
+    content = (rec.get("message") or {}).get("content") if isinstance(rec, dict) else None
+    if not isinstance(content, list):
+        continue
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        name, kind = str(block.get("name") or ""), block.get("type")
+        if kind == "tool_use" and name.endswith("waymark_sit"):
+            sat.add(block.get("id"))
+            key = (block.get("input") or {}).get("key")
+            if isinstance(key, str) and key:
+                seat_keys.add(key)
+        elif kind == "tool_result" and block.get("tool_use_id") in sat:
+            try:
+                answer = json.loads(text_of(block))
+            except Exception:
+                continue
+            t = answer.get("transcript") if isinstance(answer, dict) else None
+            if isinstance(t, dict) and t.get("url") and t.get("key"):
+                transcript_keys.add(str(t["key"]))
+                found = (str(t["url"]), str(t["key"]), str(answer.get("sitting") or ""))
+if not found:
+    sys.exit(0)
+url, key, sitting = found
+
+# ── what is redacted (R-7.1) ─────────────────────────────────────────
+fire_keys = set()
+for line in main_lines:
+    for m in re.finditer(r"Key:\s*([A-Za-z0-9_-]{16,})", line):
+        fire_keys.add(m.group(1))
+env_values = set()
+for name, value in os.environ.items():
+    if (name.endswith(("KEY", "TOKEN", "SECRET", "PASSWORD")) or name == "WAYMARK_SEAT_URL") \
+            and isinstance(value, str) and len(value) >= 8:
+        env_values.add(value)
+secrets = []   # (text as it appears inside a JSON string, class)
+for cls, values in (("seat-key", seat_keys), ("fire-key", fire_keys),
+                    ("transcript-key", transcript_keys), ("env", env_values)):
+    for v in values:
+        secrets.append((json.dumps(v)[1:-1], cls))
+secrets.sort(key=lambda s: -len(s[0]))
+PATTERNS = [re.compile(p) for p in (
+    r"gh[pos]_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}",
+    r"sk-ant-[A-Za-z0-9_-]{16,}", r"xox[bp]-[A-Za-z0-9-]{10,}",
+    r"AKIA[0-9A-Z]{16}", r"Bearer [A-Za-z0-9._~+/=-]{16,}",
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----")]
+
+def redact(line, counts):
+    # plain replacement inside the raw line: a secret is replaced where
+    # it stands, the line stays valid JSON, and a line with nothing to
+    # redact keeps its exact bytes, so its chain is the same every time
+    for text, cls in secrets:
+        n = line.count(text)
+        if n:
+            line = line.replace(text, "[redacted:" + cls + "]")
+            counts[cls] = counts.get(cls, 0) + n
+    for pat in PATTERNS:
+        line, n = pat.subn("[redacted:pattern]", line)
+        if n:
+            counts["pattern"] = counts.get("pattern", 0) + n
+    return line
+
+files = [("main", main)]
+if session:
+    for path in sorted(glob.glob(os.path.join(os.path.dirname(main), session,
+                                              "subagents", "agent-*.jsonl"))):
+        stem = os.path.basename(path)[len("agent-"):-len(".jsonl")]
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", stem):
+            files.append(("agent-" + stem, path))
+
+state_path = os.path.join(tempfile.gettempdir(),
+                          "waymark-transcript-" + re.sub(r"[^A-Za-z0-9_-]", "_", sitting or key[:8]) + ".json")
+try:
+    with open(state_path) as h:
+        held = json.load(h)
+except Exception:
+    held = {}
+
+def post(body):
+    left = BUDGET - (time.time() - START)
+    if left < 2:
+        return None, None
+    fd, tmp = tempfile.mkstemp(suffix=".json.gz")
+    try:
+        with os.fdopen(fd, "wb") as h:
+            h.write(gzip.compress(json.dumps(body).encode("utf-8")))
+        out = subprocess.run(
+            ["curl", "-sS", "--max-time", str(int(min(left, 15))), "-X", "POST",
+             "-H", "Content-Type: application/json", "-H", "Content-Encoding: gzip",
+             "-H", "Waymark-Transcript-Key: " + key,
+             "--data-binary", "@" + tmp, "-w", "\n%{http_code}", url],
+            capture_output=True, text=True)
+    finally:
+        os.unlink(tmp)
+    text = out.stdout or ""
+    code = text.rsplit("\n", 1)[-1] if "\n" in text else ""
+    try:
+        doc = json.loads(text.rsplit("\n", 1)[0]) if "\n" in text else {}
+    except Exception:
+        doc = {}
+    if not code.isdigit():
+        say("did not reach the door: " + (out.stderr or "no answer").strip().replace("\n", " "))
+        return None, None
+    return int(code), doc
+
+run_session = os.environ.get("CLAUDE_CODE_REMOTE_SESSION_ID") or None
+stopped = False
+for name, path in files:
+    if stopped:
+        break
+    per_line = []
+    lines = []
+    for l in read_lines(path):
+        c = {}
+        lines.append(redact(l, c))
+        per_line.append(c)
+    chains = []
+    prior = ZERO
+    for l in lines:
+        prior = hashlib.sha256((prior + "\n" + l).encode("utf-8")).hexdigest()
+        chains.append(prior)
+    start = int(held.get(name, 0))
+    retried = False
+    while start < len(lines):
+        batch, size = [], 0
+        for l in lines[start:]:
+            n = len(l.encode("utf-8")) + 64
+            if batch and size + n > POST_BYTES:
+                break
+            batch.append(l)
+            size += n
+        counts = {}
+        for c in per_line[start:start + len(batch)]:
+            for cls, n in c.items():
+                counts[cls] = counts.get(cls, 0) + n
+        body = {"file": name, "from": start,
+                "prior": chains[start - 1] if start else ZERO,
+                "lines": batch,
+                "redactions": counts}
+        if session:
+            body["harness_session"] = session[:128]
+        if run_session:
+            body["run_session"] = run_session[:128]
+        code, doc = post(body)
+        if code is None:
+            stopped = True
+            break
+        if code == 200:
+            start = int(doc.get("held", start + len(batch)))
+            held[name] = start
+            continue
+        if code == 409 and isinstance(doc.get("held"), int) and doc.get("title") == "Lines missing" \
+                and not retried:
+            retried = True
+            start = min(int(doc["held"]), len(lines))
+            continue
+        say("was answered %d for %s: %s" % (code, name, doc.get("detail") or doc.get("title") or ""))
+        if code in (404, 413) or (code == 409 and doc.get("title") == "Sealed"):
+            stopped = True
+        break
+try:
+    with open(state_path, "w") as h:
+        json.dump(held, h)
+except Exception:
+    pass
+PY
+printf '%s' "$HOOK" | python3 -c "$UPLOAD" >/dev/null || true
+
 # The program sums the transcript. Its argument is the path: "post"
 # prints the door's body; "block" prints the answer to the harness, or
 # nothing when the session must be left alone. BOTH print one status
