@@ -1,5 +1,9 @@
 #!/bin/bash
-# Stop and SessionEnd hook: report what this session spent in its seat.
+# Stop, SubagentStop and SessionEnd hook: report what this session spent
+# in its seat. A run that ends a turn while an agent it launched in the
+# background is still out is not done: that Stop, and every SubagentStop,
+# reports "waiting" and neither closes nor holds. Only the last Stop,
+# with nothing pending, closes the sitting with the whole run's counts.
 #
 # A FIRED run (a Routine's firing) is one prompt, so its one Stop event
 # is where the bill is known and the hook closes the sitting there
@@ -258,7 +262,7 @@ printf '%s' "$HOOK" | python3 -c "$UPLOAD" >/dev/null || true
 # The program sums the transcript. Its argument is the path: "post"
 # prints the door's body; "block" prints the answer to the harness, or
 # nothing when the session must be left alone. BOTH print one status
-# line first — "<mode>|<sitting>|<closed>" — so one walk of the
+# line first — "<mode>|<sitting>|<closed>|<waiting>" — so one walk of the
 # transcript answers every question this script asks of it.
 # NB: read, not $(cat <<PY). bash 3.2 quote-scans a heredoc that sits
 # inside a command substitution, so one apostrophe in the Python below
@@ -289,6 +293,9 @@ def text_of(block):  # a tool result is a string, or blocks of text
 
 totals, turns = dict.fromkeys(FIELDS, 0), 0
 sat, sitting, seat_mode, closed, transcript = set(), "", "", False, None
+# Agent launches by tool_use id (True when run in the background), and
+# the ids of the background agents that have not handed back yet.
+launched, pending = {}, set()
 for index, path in enumerate(paths):
     seen = set()
     try:
@@ -304,6 +311,11 @@ for index, path in enumerate(paths):
             if not isinstance(record, dict):
                 continue
             content = (record.get("message") or {}).get("content")
+            # A later line that names a pending agent is its hand-back
+            # (the task notification). The launch's own answer names it
+            # too, but it is only added below, after this check.
+            if index == 0 and pending and record.get("type") != "assistant":
+                pending -= {agent for agent in pending if agent in line}
             # The sit answers the sitting's id and the seat's mode. A
             # close in the main transcript means the bill is already in.
             for block in (content if index == 0 and isinstance(content, list) else []):
@@ -316,6 +328,9 @@ for index, path in enumerate(paths):
                     arg = block.get("input") or {}
                     closed = closed or (arg.get("kind") == "sitting"
                                         and arg.get("action") == "close")
+                elif kind == "tool_use" and name in ("Agent", "Task"):
+                    launched[block.get("id")] = bool(
+                        (block.get("input") or {}).get("run_in_background"))
                 elif kind == "tool_result" and block.get("tool_use_id") in sat:
                     answer = text_of(block)
                     named = re.findall(r'"sitting"\s*:\s*"([^"]+)"', answer)
@@ -335,6 +350,11 @@ for index, path in enumerate(paths):
                         transcript = ((str(t["url"]), str(t["key"]))
                                       if isinstance(t, dict) and t.get("url") and t.get("key")
                                       else None)
+                elif kind == "tool_result" and block.get("tool_use_id") in launched:
+                    answer = text_of(block)
+                    if launched[block.get("tool_use_id")] or re.search(
+                            r"async.*launched|launched.*background", answer, re.I | re.S):
+                        pending.update(re.findall(r"agentId:\s*([\w-]+)", answer))
             if record.get("type") != "assistant":
                 continue
             # One API response is several lines, one for each content
@@ -353,13 +373,21 @@ for index, path in enumerate(paths):
 count = tuple(totals[field] for field in FIELDS)
 # the status line, first and always: what the shell has to know about
 # this session before it decides which door to knock on
-sys.stdout.write("%s|%s|%d\n" % (seat_mode, sitting, 1 if closed else 0))
+# a run still waiting on a background agent it launched, or a subagent's
+# own stop, is not the run's last Stop
+waiting = bool(pending) or hook.get("hook_event_name") == "SubagentStop"
+sys.stdout.write("%s|%s|%d|%d\n" % (seat_mode, sitting, 1 if closed else 0,
+                                   1 if waiting else 0))
 report = {"input_tokens": count[0], "output_tokens": count[1],
           "cache_read_tokens": count[2], "cache_write_tokens": count[3],
           "turns": turns, "harness_session": session[:128],
           "note": ("Reported by the hook after %d turns." % turns)[:240]}
 if MODE == "post":
     json.dump(report, sys.stdout)
+    sys.exit(0)
+
+# While waiting, the status line alone: no close, and no hold.
+if waiting:
     sys.exit(0)
 
 # "direct": the close door, the transcript key and the body, one line
@@ -438,7 +466,9 @@ if [ -n "${WAYMARK_SEAT_URL:-}" ]; then
   MODE=${STATUS_LINE%%|*}
   REST=${STATUS_LINE#*|}
   SITTING=${REST%%|*}
-  CLOSED=${REST##*|}
+  REST=${REST#*|}
+  CLOSED=${REST%%|*}
+  WAITING=${REST#*|}
   [ -n "$BODY" ] || exit 0
 
   if [ "$EVENT" = "end" ]; then
@@ -456,6 +486,13 @@ if [ -n "${WAYMARK_SEAT_URL:-}" ]; then
   if [ "$MODE" = "interactive" ]; then
     # Every turn, never blocking: the counts so far, onto a sitting that
     # stays open. Cumulative, so a replay writes what is already there.
+    post_report "$(tally_url "$WAYMARK_SEAT_URL")" "$BODY"
+    exit 0
+  fi
+
+  # A fired run still waiting on an agent it launched is not done: tally
+  # what it has spent so far, and leave the close to its last Stop.
+  if [ "$WAITING" = "1" ]; then
     post_report "$(tally_url "$WAYMARK_SEAT_URL")" "$BODY"
     exit 0
   fi
