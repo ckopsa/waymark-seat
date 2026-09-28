@@ -293,9 +293,10 @@ def text_of(block):  # a tool result is a string, or blocks of text
 
 totals, turns = dict.fromkeys(FIELDS, 0), 0
 sat, sitting, seat_mode, closed, transcript = set(), "", "", False, None
-# Agent launches by tool_use id (True when run in the background), and
-# the ids of the background agents that have not handed back yet.
-launched, pending = {}, set()
+# Agent launches by tool_use id (True when run in the background), the
+# tool_use ids of background Bash and Monitor launches, and the ids of
+# the background agents and tasks that have not handed back yet.
+launched, tasks, pending = {}, set(), set()
 for index, path in enumerate(paths):
     seen = set()
     try:
@@ -331,6 +332,13 @@ for index, path in enumerate(paths):
                 elif kind == "tool_use" and name in ("Agent", "Task"):
                     launched[block.get("id")] = bool(
                         (block.get("input") or {}).get("run_in_background"))
+                elif kind == "tool_use" and (name == "Monitor" or (
+                        name == "Bash" and (block.get("input") or {}).get("run_in_background"))):
+                    tasks.add(block.get("id"))
+                elif kind == "tool_use" and name == "TaskStop":
+                    # a stopped task will not hand back: drop the id it names
+                    arg = block.get("input") or {}
+                    pending -= {v for v in arg.values() if isinstance(v, str)}
                 elif kind == "tool_result" and block.get("tool_use_id") in sat:
                     answer = text_of(block)
                     named = re.findall(r'"sitting"\s*:\s*"([^"]+)"', answer)
@@ -355,6 +363,12 @@ for index, path in enumerate(paths):
                     if launched[block.get("tool_use_id")] or re.search(
                             r"async.*launched|launched.*background", answer, re.I | re.S):
                         pending.update(re.findall(r"agentId:\s*([\w-]+)", answer))
+                elif kind == "tool_result" and block.get("tool_use_id") in tasks:
+                    # "Command running in background with ID: <id>.", and the
+                    # Monitor's answer names its task id likewise; the hand-back
+                    # is a later <task-notification> line naming <task-id><id>
+                    pending.update(re.findall(
+                        r"(?:\bID|\btask[ _-]?id)[\"'\s:=]+([\w-]+)", text_of(block), re.I))
             if record.get("type") != "assistant":
                 continue
             # One API response is several lines, one for each content
