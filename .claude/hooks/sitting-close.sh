@@ -459,8 +459,8 @@ post_report() {
       detail=$(printf '%s' "${reply%$'\n'*}" | python3 -c 'import json,sys
 try: print(json.loads(sys.stdin.read()).get("detail") or "")
 except Exception: pass' 2>/dev/null)
-      echo "waymark: the sitting report was answered ${status}. ${detail}" >&2 ;;
-    *) echo "waymark: the sitting report did not reach the door: $(printf '%s' \
+      echo "waymark: the sitting report for ${SITTING:-no sitting} was answered ${status}. ${detail}" >&2 ;;
+    *) echo "waymark: the sitting report for ${SITTING:-no sitting} did not reach the door: $(printf '%s' \
          "$reply" | tr '\n' ' ')" >&2 ;;
   esac
   return 0
@@ -552,25 +552,34 @@ fi
 # transcript's address and key, the key also opens the close beside it,
 # and the transcript went up above. A 2xx means the bill is in and the
 # stop is not held; anything else falls back to the hold below, once.
+# Every way the close can miss says so on stderr, one line naming the
+# sitting and the reason, so the next miss can be read off the hook log.
+miss() {
+  echo "waymark: the close of sitting ${SITTING:-(none)} did not land: $1; holding the stop." >&2
+}
 direct_close() {
   local out url rest key body reply status
-  out=$(printf '%s' "$HOOK" | python3 -c "$SUM" direct 2>/dev/null) || return 1
+  out=$(printf '%s' "$HOOK" | python3 -c "$SUM" direct 2>/dev/null) || {
+    miss "the hook could not read the transcript"; return 1; }
   case "$out" in
     *$'\n'*$'\n'*$'\n'*) out=${out#*$'\n'} ;;
-    *) return 1 ;;
+    *) miss "the sit answered no transcript address and key"; return 1 ;;
   esac
   url=${out%%$'\n'*}
   rest=${out#*$'\n'}
   key=${rest%%$'\n'*}
   body=${rest#*$'\n'}
-  [ -n "$url" ] && [ -n "$key" ] && [ -n "$body" ] || return 1
+  [ -n "$url" ] && [ -n "$key" ] && [ -n "$body" ] || {
+    miss "the close door, the transcript key or the counts came back empty"; return 1; }
   reply=$(curl -sS --max-time 20 -X POST -H 'Content-Type: application/json' \
     -H "Waymark-Transcript-Key: ${key}" -d "$body" -w '\n%{http_code}' "$url" 2>&1)
   status=${reply##*$'\n'}
   case "$status" in
     2??) return 0 ;;
+    [1-5][0-9][0-9])
+      miss "the door answered ${status}: $(printf '%s' "${reply%$'\n'*}" | tr '\n' ' ' | cut -c1-200)" ;;
+    *) miss "it did not reach the door: $(printf '%s' "$reply" | tr '\n' ' ' | cut -c1-200)" ;;
   esac
-  echo "waymark: the close by the transcript key was answered ${status}; holding the stop." >&2
   return 1
 }
 
