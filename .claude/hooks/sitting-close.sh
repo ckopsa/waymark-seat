@@ -17,8 +17,9 @@
 # answer to waymark_sit, which carries "mode" beside "sitting" — so this
 # hook reads it out of the transcript rather than being told.
 #
-# Argument: "end" for the SessionEnd entry; anything else (the Stop
-# entry passes nothing) is the Stop event.
+# Argument: "end" for the SessionEnd entry; "close-run" for a close
+# from outside the run (see below: localfire calls it); anything else
+# (the Stop entry passes nothing) is the Stop event.
 #
 # Two paths, as R-12.26 has them. When the environment carries the
 # door's URL, the hook posts. When it carries nothing — a cloud
@@ -400,6 +401,21 @@ if MODE == "post":
     json.dump(report, sys.stdout)
     sys.exit(0)
 
+# "close-run": what "direct" answers, for a close from OUTSIDE the run.
+# No stop is being held and the run is gone, so neither a pending agent
+# nor stop_hook_active holds it back, and the caller note (from
+# WAYMARK_CLOSE_NOTE) stands in for the hook note when one is given.
+if MODE == "close-run":
+    note = os.environ.get("WAYMARK_CLOSE_NOTE", "").strip()
+    if note:
+        report["note"] = note[:240]
+    if sitting and not closed and transcript \
+            and re.search(r"/transcript/?$", transcript[0]):
+        sys.stdout.write(re.sub(r"/transcript/?$", "/close", transcript[0]) + "\n")
+        sys.stdout.write(transcript[1] + "\n")
+        json.dump(report, sys.stdout)
+    sys.exit(0)
+
 # While waiting, the status line alone: no close, and no hold.
 if waiting:
     sys.exit(0)
@@ -465,6 +481,51 @@ except Exception: pass' 2>/dev/null)
   esac
   return 0
 }
+
+# An EXTERNAL close for a fired run: localfire calls it for a run it
+# marks lost or whose process exited, when no Stop will come to close
+# the sitting. `sitting-close.sh close-run [note]`, with the run's
+# {session_id, transcript_path} on stdin and the note as the argument or
+# in WAYMARK_CLOSE_NOTE. It finds the sitting and the transcript key as
+# direct_close does and posts the close with the harness's counts and
+# that note, whether or not the environment carries the door. It prints
+# ONE status line on stdout, for the caller: "closed <sitting>",
+# "already-closed <sitting>" (a close in the transcript, or a 409), or
+# "failed <sitting>: <reason>"; and it exits 0 only when the sitting is
+# closed, so a failure is the caller's to say.
+if [ "$EVENT" = "close-run" ]; then
+  OUT=$(printf '%s' "$HOOK" | WAYMARK_CLOSE_NOTE="${2:-${WAYMARK_CLOSE_NOTE:-}}" \
+    python3 -c "$SUM" close-run 2>/dev/null) || {
+    echo "failed (none): the transcript could not be read"; exit 1; }
+  STATUS_LINE=${OUT%%$'\n'*}
+  REST=${STATUS_LINE#*|}
+  SITTING=${REST%%|*}
+  REST=${REST#*|}
+  CLOSED=${REST%%|*}
+  [ -n "$SITTING" ] || { echo "failed (none): the transcript holds no sit"; exit 1; }
+  [ "$CLOSED" = "0" ] || { echo "already-closed $SITTING"; exit 0; }
+  case "$OUT" in
+    *$'\n'*$'\n'*$'\n'*) OUT=${OUT#*$'\n'} ;;
+    *) echo "failed $SITTING: the sit answered no transcript address and key"; exit 1 ;;
+  esac
+  URL=${OUT%%$'\n'*}
+  REST=${OUT#*$'\n'}
+  KEY=${REST%%$'\n'*}
+  BODY=${REST#*$'\n'}
+  [ -n "$URL" ] && [ -n "$KEY" ] && [ -n "$BODY" ] || {
+    echo "failed $SITTING: the close door, the transcript key or the counts came back empty"; exit 1; }
+  REPLY=$(curl -sS --max-time 20 -X POST -H 'Content-Type: application/json' \
+    -H "Waymark-Transcript-Key: ${KEY}" -d "$BODY" -w '\n%{http_code}' "$URL" 2>&1)
+  STATUS=${REPLY##*$'\n'}
+  case "$STATUS" in
+    2??) echo "closed $SITTING"; exit 0 ;;
+    409) echo "already-closed $SITTING"; exit 0 ;;
+    [1-5][0-9][0-9])
+      echo "failed $SITTING: the door answered ${STATUS}: $(printf '%s' "${REPLY%$'\n'*}" | tr '\n' ' ' | cut -c1-200)" ;;
+    *) echo "failed $SITTING: it did not reach the door: $(printf '%s' "$REPLY" | tr '\n' ' ' | cut -c1-200)" ;;
+  esac
+  exit 1
+fi
 
 # Path one: the environment carries the door.
 if [ -n "${WAYMARK_SEAT_URL:-}" ]; then
