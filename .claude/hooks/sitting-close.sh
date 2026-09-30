@@ -512,8 +512,9 @@ if [ "$EVENT" = "close-run" ]; then
   REST=${OUT#*$'\n'}
   KEY=${REST%%$'\n'*}
   BODY=${REST#*$'\n'}
-  [ -n "$URL" ] && [ -n "$KEY" ] && [ -n "$BODY" ] || {
-    echo "failed $SITTING: the close door, the transcript key or the counts came back empty"; exit 1; }
+  if [ -z "$URL" ] || [ -z "$KEY" ] || [ -z "$BODY" ]; then
+    echo "failed $SITTING: the close door, the transcript key or the counts came back empty"; exit 1
+  fi
   REPLY=$(curl -sS --max-time 20 -X POST -H 'Content-Type: application/json' \
     -H "Waymark-Transcript-Key: ${KEY}" -d "$BODY" -w '\n%{http_code}' "$URL" 2>&1)
   STATUS=${REPLY##*$'\n'}
@@ -630,8 +631,9 @@ direct_close() {
   rest=${out#*$'\n'}
   key=${rest%%$'\n'*}
   body=${rest#*$'\n'}
-  [ -n "$url" ] && [ -n "$key" ] && [ -n "$body" ] || {
-    miss "the close door, the transcript key or the counts came back empty"; return 1; }
+  if [ -z "$url" ] || [ -z "$key" ] || [ -z "$body" ]; then
+    miss "the close door, the transcript key or the counts came back empty"; return 1
+  fi
   reply=$(curl -sS --max-time 20 -X POST -H 'Content-Type: application/json' \
     -H "Waymark-Transcript-Key: ${key}" -d "$body" -w '\n%{http_code}' "$url" 2>&1)
   status=${reply##*$'\n'}
