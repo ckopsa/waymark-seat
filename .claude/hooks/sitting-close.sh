@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # Stop, SubagentStop and SessionEnd hook: report what this session spent
 # in its seat. A run that ends a turn while an agent it launched in the
 # background is still out is not done: that Stop, and every SubagentStop,
