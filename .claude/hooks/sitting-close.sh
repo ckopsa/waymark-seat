@@ -299,6 +299,9 @@ sat, sitting, seat_mode, closed, transcript = set(), "", "", False, None
 # tool_use ids of background Bash and Monitor launches, and the ids of
 # the background agents and tasks that have not handed back yet.
 launched, tasks, pending = {}, set(), set()
+# The session's queue: the lines enqueued and not yet taken off. A
+# hand-back waits here between the agent's end and the turn it wakes.
+queued = []
 for index, path in enumerate(paths):
     seen = set()
     try:
@@ -314,6 +317,28 @@ for index, path in enumerate(paths):
             if not isinstance(record, dict):
                 continue
             content = (record.get("message") or {}).get("content")
+            # An enqueue names the agent too, but it is not the hand-back:
+            # the message is only read when it is taken off the queue.
+            if index == 0 and record.get("type") == "queue-operation":
+                operation, body = record.get("operation"), record.get("content")
+                if operation == "enqueue":
+                    queued.append((body, line))
+                elif operation == "popAll":
+                    taken, queued = queued, []
+                    pending -= {agent for agent in pending
+                                if any(agent in was for _, was in taken)}
+                elif queued:
+                    # A dequeue takes the named one, or the oldest. A remove
+                    # takes the named one or nothing: taking an unrelated
+                    # line off would let an unread message stop holding
+                    # the close.
+                    at = next((i for i, (had, _) in enumerate(queued)
+                               if body is not None and had == body),
+                              None if operation == "remove" else 0)
+                    if at is not None:
+                        was = queued.pop(at)[1]
+                        pending -= {agent for agent in pending if agent in was}
+                continue
             # A later line that names a pending agent is its hand-back
             # (the task notification). The launch's own answer names it
             # too, but it is only added below, after this check.
@@ -389,9 +414,9 @@ for index, path in enumerate(paths):
 count = tuple(totals[field] for field in FIELDS)
 # the status line, first and always: what the shell has to know about
 # this session before it decides which door to knock on
-# a run still waiting on a background agent it launched, or a subagent's
-# own stop, is not the run's last Stop
-waiting = bool(pending) or hook.get("hook_event_name") == "SubagentStop"
+# a run still waiting on a background agent it launched, a message
+# still in its queue, or a subagent's own stop, is not the run's last Stop
+waiting = bool(pending) or bool(queued) or hook.get("hook_event_name") == "SubagentStop"
 sys.stdout.write("%s|%s|%d|%d\n" % (seat_mode, sitting, 1 if closed else 0,
                                    1 if waiting else 0))
 report = {"input_tokens": count[0], "output_tokens": count[1],

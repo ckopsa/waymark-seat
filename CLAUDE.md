@@ -4,9 +4,9 @@ This is a seat's session. A Routine starts it.
 
 Your instructions are in the Routine. Do what they say.
 
-Read no file in this place. This place holds three files: this
-note, `.claude/settings.json` and `.claude/hooks/sitting-close.sh`.
-The two other files are for the harness. They are not for you.
+Read no file in this place. This place holds four files: this note,
+`.claude/settings.json`, `.claude/hooks/sitting-close.sh` and
+`inbox-feed.sh`. The three other files are for the harness, not for you.
 
 There is no code here. There is no design document here. Do not
 look for one.
