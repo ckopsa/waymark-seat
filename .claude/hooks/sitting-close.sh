@@ -1,18 +1,21 @@
 #!/bin/bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Stop, SubagentStop and SessionEnd hook: report what this session spent
-# in its seat. A run that ends a turn while an agent it launched in the
-# background is still out is not done: that Stop, and every SubagentStop,
-# reports "waiting" and neither closes nor holds. Only the last Stop,
-# with nothing pending, closes the sitting with the whole run's counts.
+# Stop, SubagentStop and SessionEnd hook: upload this session's new
+# transcript lines and report what it has spent in its seat, every time
+# it runs. The report is the session's cumulative counts, posted to the
+# usage door with the transcript key the sit answered
+# (docs/spec-spend.md §3, §7): a repeat writes nothing new, and a late
+# one after the sitting ended still lands. The engine never estimates
+# what a hook reported.
 #
-# A FIRED run (a Routine's firing) is one prompt, so its one Stop event
-# is where the bill is known and the hook closes the sitting there
-# (docs/spec-seat.md R-12.17). An INTERACTIVE sitting is a person's own
-# session: it raises a Stop event on EVERY turn and waits in between, so
-# the hook must not close and must not block there — it posts a TALLY
-# (R-12.25), and the close comes from SessionEnd. The engine never
-# estimates; both are the harness's own counts, reported.
+# A FIRED run (a Routine's firing) then closes its sitting at its last
+# Stop (docs/spec-seat.md R-12.17). A run that ends a turn while an
+# agent it launched in the background is still out is not done: that
+# Stop, and every SubagentStop, reports and does not close. Only the
+# last Stop, with nothing pending, closes the sitting with the whole
+# run's counts. An INTERACTIVE sitting is a person's own session: it
+# reports on every turn and is never closed or blocked there; its close
+# comes from SessionEnd (R-12.25).
 #
 # The mode is the SEAT's (R-10.8) and the session learns it from the
 # answer to waymark_sit, which carries "mode" beside "sitting" — so this
@@ -22,14 +25,13 @@
 # from outside the run (see below: localfire calls it); anything else
 # (the Stop entry passes nothing) is the Stop event.
 #
-# Two paths, as R-12.26 has them. When the environment carries the
-# door's URL, the hook posts. When it carries nothing — a cloud
-# environment that takes a repository and no settings — a FIRED session
-# closes its sitting with the transcript key its sit answered, and is
-# held one time and given its counts to close by hand only when that
-# close is refused. An
-# INTERACTIVE one is told once that a tally needs the URL and left
-# alone: a block on every turn would stop the person's work.
+# Two ways to close, as R-12.26 has them. When the environment carries
+# the door's URL, the hook posts the close there. When it carries
+# nothing — a cloud environment that takes a repository and no
+# settings — a FIRED session closes its sitting with the transcript key
+# its sit answered, and an INTERACTIVE one is left to the sweep. The
+# stop is never held: the counts are in already, and the engine ends a
+# sitting nobody closes (docs/spec-spend.md §4).
 set -u
 
 EVENT="${1:-stop}"
@@ -40,8 +42,8 @@ HOOK=$(cat)   # the hook's JSON, on stdin. Both paths read it.
 # answers an address and a key for this sitting's transcript, beside the
 # sitting's id; the program below finds the last such answer, redacts
 # every line, and appends what the engine does not hold yet, chained.
-# It runs on every Stop and on SessionEnd, the second Stop of a fired
-# run included: that one comes after the close, and it carries the last
+# It runs on every Stop and on SessionEnd, a fired run's SessionEnd
+# included: that one comes after the close, and it carries the last
 # lines. It prints nothing on stdout (the harness reads stdout as the
 # hook's decision), it spends at most 20 seconds, and nothing it meets
 # fails the session: a refusal or a dark network is one line on stderr,
@@ -262,10 +264,11 @@ PY
 printf '%s' "$HOOK" | python3 -c "$UPLOAD" >/dev/null || true
 
 # The program sums the transcript. Its argument is the path: "post"
-# prints the door's body; "block" prints the answer to the harness, or
-# nothing when the session must be left alone. BOTH print one status
-# line first — "<mode>|<sitting>|<closed>|<waiting>" — so one walk of the
-# transcript answers every question this script asks of it.
+# prints the door's body; "usage", "close-run" and "direct" print a
+# door, the transcript key and the body, one line each, or nothing when
+# there is nothing to post. ALL print one status line first —
+# "<mode>|<sitting>|<closed>|<waiting>" — so one walk of the transcript
+# answers every question this script asks of it.
 # NB: read, not $(cat <<PY). bash 3.2 quote-scans a heredoc that sits
 # inside a command substitution, so one apostrophe in the Python below
 # inverts every quote after it and the script stops parsing (the error
@@ -427,6 +430,16 @@ if MODE == "post":
     json.dump(report, sys.stdout)
     sys.exit(0)
 
+# "usage": the usage door beside the transcript, every time the hook
+# runs — waiting, closed or interactive alike, since the counts are
+# cumulative and the door takes a report after the end.
+if MODE == "usage":
+    if sitting and transcript and re.search(r"/transcript/?$", transcript[0]):
+        sys.stdout.write(re.sub(r"/transcript/?$", "/usage", transcript[0]) + "\n")
+        sys.stdout.write(transcript[1] + "\n")
+        json.dump(report, sys.stdout)
+    sys.exit(0)
+
 # "close-run": what "direct" answers, for a close from OUTSIDE the run.
 # No stop is being held and the run is gone, so neither a pending agent
 # nor stop_hook_active holds it back, and the caller note (from
@@ -442,7 +455,7 @@ if MODE == "close-run":
         json.dump(report, sys.stdout)
     sys.exit(0)
 
-# While waiting, the status line alone: no close, and no hold.
+# While waiting, the status line alone: no close.
 if waiting:
     sys.exit(0)
 
@@ -450,38 +463,13 @@ if waiting:
 # each, when this sitting is open and the sit answered a transcript
 # whose address ends in /transcript; the status line alone otherwise.
 if MODE == "direct":
-    if sitting and not closed and not hook.get("stop_hook_active") \
+    if sitting and not closed \
             and transcript and re.search(r"/transcript/?$", transcript[0]):
         sys.stdout.write(re.sub(r"/transcript/?$", "/close", transcript[0]) + "\n")
         sys.stdout.write(transcript[1] + "\n")
         json.dump(report, sys.stdout)
     sys.exit(0)
-
-# Say nothing unless a sitting is open, no close is in the transcript,
-# and the harness is not already going on because this hook blocked.
-if not sitting or closed or hook.get("stop_hook_active"):
-    sys.exit(0)
-json.dump({"decision": "block", "reason": (
-    'Before you stop, close your sitting with its exact usage. Call '
-    'waymark_invoke with kind "sitting", id "%s", action "close", and input '
-    '{"input_tokens": %d, "output_tokens": %d, "cache_read_tokens": %d, '
-    '"cache_write_tokens": %d, "turns": %d, "harness_session": "%s", "note": '
-    '"<one sentence: what this wake moved, at most 240 characters>"}. Copy the '
-    'numbers exactly as written; they are the harness\'s count, not yours. '
-    'Then stop.') % (sitting, count[0], count[1], count[2], count[3],
-                     turns, session)}, sys.stdout)
 PY
-
-# The tally door is the close's sibling, one word over. The variable
-# names the CLOSE door (it always has), so the tally is derived: swap a
-# trailing /close for /tally, and for a URL that does not end that way,
-# append /tally and let the door say if it is wrong.
-tally_url() {
-  case "$1" in
-    */close) printf '%s/tally' "${1%/close}" ;;
-    *) printf '%s/tally' "$1" ;;
-  esac
-}
 
 # One POST, and a door that refuses must never fail the session: say one
 # line on stderr and go.
@@ -554,6 +542,37 @@ if [ "$EVENT" = "close-run" ]; then
   exit 1
 fi
 
+# Every event, waiting or not: the counts so far, through the usage
+# door, with the transcript key alone (docs/spec-spend.md §3). A miss is
+# one line on stderr; the next event reports the whole total again.
+report_usage() {
+  local out sitting url rest key body reply status
+  out=$(printf '%s' "$HOOK" | python3 -c "$SUM" usage 2>/dev/null) || {
+    echo "waymark: the usage report could not read the transcript." >&2; return 0; }
+  sitting=${out%%$'\n'*}
+  sitting=${sitting#*|}
+  sitting=${sitting%%|*}
+  case "$out" in
+    *$'\n'*$'\n'*$'\n'*) out=${out#*$'\n'} ;;
+    *) return 0 ;;
+  esac
+  url=${out%%$'\n'*}
+  rest=${out#*$'\n'}
+  key=${rest%%$'\n'*}
+  body=${rest#*$'\n'}
+  reply=$(curl -sS --max-time 20 -X POST -H 'Content-Type: application/json' \
+    -H "Waymark-Transcript-Key: ${key}" -d "$body" -w '\n%{http_code}' "$url" 2>&1)
+  status=${reply##*$'\n'}
+  case "$status" in
+    2??) ;;
+    [1-5][0-9][0-9])
+      echo "waymark: the usage report for ${sitting} was answered ${status}: $(printf '%s' "${reply%$'\n'*}" | tr '\n' ' ' | cut -c1-200)" >&2 ;;
+    *) echo "waymark: the usage report for ${sitting} did not reach the door: $(printf '%s' "$reply" | tr '\n' ' ' | cut -c1-200)" >&2 ;;
+  esac
+  return 0
+}
+report_usage
+
 # Path one: the environment carries the door.
 if [ -n "${WAYMARK_SEAT_URL:-}" ]; then
   OUT=$(printf '%s' "$HOOK" | python3 -c "$SUM" post 2>/dev/null) || {
@@ -574,7 +593,7 @@ if [ -n "${WAYMARK_SEAT_URL:-}" ]; then
   [ -n "$BODY" ] || exit 0
 
   if [ "$EVENT" = "end" ]; then
-    # SessionEnd closes what the turns tallied (R-12.25). Only an
+    # SessionEnd closes what the turns reported (R-12.25). Only an
     # interactive sitting: a fired run's Stop already posted its close,
     # and a second close here would be answered 409 — or, worse, paired
     # with another run's open sitting, since this run's is gone.
@@ -585,17 +604,9 @@ if [ -n "${WAYMARK_SEAT_URL:-}" ]; then
     exit 0
   fi
 
-  if [ "$MODE" = "interactive" ]; then
-    # Every turn, never blocking: the counts so far, onto a sitting that
-    # stays open. Cumulative, so a replay writes what is already there.
-    post_report "$(tally_url "$WAYMARK_SEAT_URL")" "$BODY"
-    exit 0
-  fi
-
-  # A fired run still waiting on an agent it launched is not done: tally
-  # what it has spent so far, and leave the close to its last Stop.
-  if [ "$WAITING" = "1" ]; then
-    post_report "$(tally_url "$WAYMARK_SEAT_URL")" "$BODY"
+  # An interactive turn, and a fired run still waiting on an agent it
+  # launched, reported above; the close is their last event's.
+  if [ "$MODE" = "interactive" ] || [ "$WAITING" = "1" ]; then
     exit 0
   fi
 
@@ -608,75 +619,53 @@ fi
 # Path two: no door in the environment.
 [ "$EVENT" = "end" ] && exit 0   # nothing to post, and SessionEnd cannot block
 
-ANSWER=$(printf '%s' "$HOOK" | python3 -c "$SUM" block 2>/dev/null) || {
+# A fired run closes its own sitting (R-12.17): the sit answered the
+# transcript's address and key, the key also opens the close beside it,
+# and the transcript and the counts went up above. An interactive
+# sitting is never closed here: the person is still working, and the
+# sweep closes it after the seat's sitting_idle_seconds. The stop is
+# never held, and stdout stays empty — the harness reads it as the
+# hook's decision. Every way the close can miss says so on stderr, one
+# line naming the sitting and the reason, so the next miss can be read
+# off the hook log.
+OUT=$(printf '%s' "$HOOK" | python3 -c "$SUM" direct 2>/dev/null) || {
   echo "waymark: the sitting hook could not read the transcript." >&2; exit 0; }
-STATUS_LINE=${ANSWER%%$'\n'*}
-case "$ANSWER" in
-  *$'\n'*) REPLY=${ANSWER#*$'\n'} ;;
-  # the status line alone: this session is not to be held, and stdout
-  # must stay empty — the harness reads it as the hook's decision
-  *) REPLY="" ;;
-esac
+STATUS_LINE=${OUT%%$'\n'*}
 MODE=${STATUS_LINE%%|*}
 REST=${STATUS_LINE#*|}
 SITTING=${REST%%|*}
-
-# An interactive sitting is never blocked and never closed by hand: the
-# person is still working. Say once what the environment is missing —
-# once per sitting, by a marker beside the temporary files — and let the
-# sweep close it after the seat's sitting_idle_seconds.
-if [ "$MODE" = "interactive" ]; then
-  if [ -n "$SITTING" ]; then
-    MARK="${TMPDIR:-/tmp}/waymark-tally-note-${SITTING//[^A-Za-z0-9_-]/_}"
-    if [ ! -e "$MARK" ]; then
-      : > "$MARK" 2>/dev/null || true
-      echo "waymark: an interactive sitting tallies through WAYMARK_SEAT_URL; none is set, the sweep closes it." >&2
-    fi
-  fi
+REST=${REST#*|}
+CLOSED=${REST%%|*}
+WAITING=${REST#*|}
+# a session that never sat (the hook rides in every waymark cloud
+# session), one already closed, an interactive one, and a fired one
+# still waiting on an agent: nothing to close
+if [ -z "$SITTING" ] || [ "$CLOSED" != "0" ] || [ "$WAITING" != "0" ] \
+    || [ "$MODE" = "interactive" ]; then
   exit 0
 fi
-
-# A fired run closes its own sitting (R-12.17): the sit answered the
-# transcript's address and key, the key also opens the close beside it,
-# and the transcript went up above. A 2xx means the bill is in and the
-# stop is not held; anything else falls back to the hold below, once.
-# Every way the close can miss says so on stderr, one line naming the
-# sitting and the reason, so the next miss can be read off the hook log.
 miss() {
-  echo "waymark: the close of sitting ${SITTING:-(none)} did not land: $1; holding the stop." >&2
+  echo "waymark: the close of sitting ${SITTING} did not land: $1." >&2
 }
-direct_close() {
-  local out url rest key body reply status
-  out=$(printf '%s' "$HOOK" | python3 -c "$SUM" direct 2>/dev/null) || {
-    miss "the hook could not read the transcript"; return 1; }
-  case "$out" in
-    *$'\n'*$'\n'*$'\n'*) out=${out#*$'\n'} ;;
-    *) miss "the sit answered no transcript address and key"; return 1 ;;
-  esac
-  url=${out%%$'\n'*}
-  rest=${out#*$'\n'}
-  key=${rest%%$'\n'*}
-  body=${rest#*$'\n'}
-  if [ -z "$url" ] || [ -z "$key" ] || [ -z "$body" ]; then
-    miss "the close door, the transcript key or the counts came back empty"; return 1
-  fi
-  reply=$(curl -sS --max-time 20 -X POST -H 'Content-Type: application/json' \
-    -H "Waymark-Transcript-Key: ${key}" -d "$body" -w '\n%{http_code}' "$url" 2>&1)
-  status=${reply##*$'\n'}
-  case "$status" in
-    2??) return 0 ;;
-    [1-5][0-9][0-9])
-      miss "the door answered ${status}: $(printf '%s' "${reply%$'\n'*}" | tr '\n' ' ' | cut -c1-200)" ;;
-    *) miss "it did not reach the door: $(printf '%s' "$reply" | tr '\n' ' ' | cut -c1-200)" ;;
-  esac
-  return 1
-}
-
-# Hold the stop one time and hand the session the id and the counts. A
-# session that never sat gets nothing: the hook rides in every waymark
-# cloud session.
-if [ -n "$REPLY" ]; then
-  direct_close && exit 0
-  printf '%s\n' "$REPLY"
+case "$OUT" in
+  *$'\n'*$'\n'*$'\n'*) OUT=${OUT#*$'\n'} ;;
+  *) miss "the sit answered no transcript address and key"; exit 0 ;;
+esac
+URL=${OUT%%$'\n'*}
+REST=${OUT#*$'\n'}
+KEY=${REST%%$'\n'*}
+BODY=${REST#*$'\n'}
+if [ -z "$URL" ] || [ -z "$KEY" ] || [ -z "$BODY" ]; then
+  miss "the close door, the transcript key or the counts came back empty"; exit 0
 fi
+REPLY=$(curl -sS --max-time 20 -X POST -H 'Content-Type: application/json' \
+  -H "Waymark-Transcript-Key: ${KEY}" -d "$BODY" -w '\n%{http_code}' "$URL" 2>&1)
+STATUS=${REPLY##*$'\n'}
+case "$STATUS" in
+  # a 409 is a close already written: the bill is in
+  2??|409) ;;
+  [1-5][0-9][0-9])
+    miss "the door answered ${STATUS}: $(printf '%s' "${REPLY%$'\n'*}" | tr '\n' ' ' | cut -c1-200)" ;;
+  *) miss "it did not reach the door: $(printf '%s' "$REPLY" | tr '\n' ' ' | cut -c1-200)" ;;
+esac
 exit 0
