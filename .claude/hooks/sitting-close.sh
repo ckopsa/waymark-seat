@@ -25,18 +25,16 @@
 # from outside the run (see below: localfire calls it); anything else
 # (the Stop entry passes nothing) is the Stop event.
 #
-# Two ways to close, as R-12.26 has them. When the environment carries
-# the door's URL, the hook posts the close there. When it carries
-# nothing — a cloud environment that takes a repository and no
-# settings — a FIRED session closes its sitting with the transcript key
-# its sit answered, and an INTERACTIVE one is left to the sweep. The
+# One way to close (R-22.7): a FIRED session closes its sitting with the
+# transcript key its sit answered, and an INTERACTIVE one is left to the
+# sweep. The environment carries no door and no seat key. The
 # stop is never held: the counts are in already, and the engine ends a
 # sitting nobody closes (docs/spec-spend.md §4).
 set -u
 
 EVENT="${1:-stop}"
 
-HOOK=$(cat)   # the hook's JSON, on stdin. Both paths read it.
+HOOK=$(cat)   # the hook's JSON, on stdin. Every step below reads it.
 
 # THE TRANSCRIPT GOES FIRST (docs/spec-transcript.md § 6). The sit
 # answers an address and a key for this sitting's transcript, beside the
@@ -127,7 +125,7 @@ for line in main_lines:
         fire_keys.add(m.group(1))
 env_values = set()
 for name, value in os.environ.items():
-    if (name.endswith(("KEY", "TOKEN", "SECRET", "PASSWORD")) or name == "WAYMARK_SEAT_URL") \
+    if name.endswith(("KEY", "TOKEN", "SECRET", "PASSWORD")) \
             and isinstance(value, str) and len(value) >= 8:
         env_values.add(value)
 secrets = []   # (text as it appears inside a JSON string, class)
@@ -426,10 +424,6 @@ report = {"input_tokens": count[0], "output_tokens": count[1],
           "cache_read_tokens": count[2], "cache_write_tokens": count[3],
           "turns": turns, "harness_session": session[:128],
           "note": ("Reported by the hook after %d turns." % turns)[:240]}
-if MODE == "post":
-    json.dump(report, sys.stdout)
-    sys.exit(0)
-
 # "usage": the usage door beside the transcript, every time the hook
 # runs — waiting, closed or interactive alike, since the counts are
 # cumulative and the door takes a report after the end.
@@ -471,38 +465,13 @@ if MODE == "direct":
     sys.exit(0)
 PY
 
-# One POST, and a door that refuses must never fail the session: say one
-# line on stderr and go.
-post_report() {
-  # The key goes in a header, not a bearer: the identity layer reads a
-  # bearer as an OIDC token. A stored credential adds the header
-  # outside the container, so send the variable only when it is set.
-  local url="$1" body="$2" reply status detail
-  local key=()
-  [ -n "${WAYMARK_SEAT_KEY:-}" ] && key=(-H "Waymark-Seat-Key: ${WAYMARK_SEAT_KEY}")
-  reply=$(curl -sS --max-time 20 -X POST -H 'Content-Type: application/json' \
-    ${key[@]+"${key[@]}"} -d "$body" -w '\n%{http_code}' "$url" 2>&1)
-  status=${reply##*$'\n'}
-  case "$status" in
-    2??) return 0 ;;
-    [1-5][0-9][0-9])
-      detail=$(printf '%s' "${reply%$'\n'*}" | python3 -c 'import json,sys
-try: print(json.loads(sys.stdin.read()).get("detail") or "")
-except Exception: pass' 2>/dev/null)
-      echo "waymark: the sitting report for ${SITTING:-no sitting} was answered ${status}. ${detail}" >&2 ;;
-    *) echo "waymark: the sitting report for ${SITTING:-no sitting} did not reach the door: $(printf '%s' \
-         "$reply" | tr '\n' ' ')" >&2 ;;
-  esac
-  return 0
-}
-
 # An EXTERNAL close for a fired run: localfire calls it for a run it
 # marks lost or whose process exited, when no Stop will come to close
 # the sitting. `sitting-close.sh close-run [note]`, with the run's
 # {session_id, transcript_path} on stdin and the note as the argument or
 # in WAYMARK_CLOSE_NOTE. It finds the sitting and the transcript key as
 # direct_close does and posts the close with the harness's counts and
-# that note, whether or not the environment carries the door. It prints
+# that note. It prints
 # ONE status line on stdout, for the caller: "closed <sitting>",
 # "already-closed <sitting>" (a close in the transcript, or a 409), or
 # "failed <sitting>: <reason>"; and it exits 0 only when the sitting is
@@ -573,50 +542,7 @@ report_usage() {
 }
 report_usage
 
-# Path one: the environment carries the door.
-if [ -n "${WAYMARK_SEAT_URL:-}" ]; then
-  OUT=$(printf '%s' "$HOOK" | python3 -c "$SUM" post 2>/dev/null) || {
-    echo "waymark: the sitting hook could not read the transcript." >&2; exit 0; }
-  STATUS_LINE=${OUT%%$'\n'*}
-  # the payload is whatever follows the status line — and nothing at
-  # all when the program printed the status line alone
-  case "$OUT" in
-    *$'\n'*) BODY=${OUT#*$'\n'} ;;
-    *) BODY="" ;;
-  esac
-  MODE=${STATUS_LINE%%|*}
-  REST=${STATUS_LINE#*|}
-  SITTING=${REST%%|*}
-  REST=${REST#*|}
-  CLOSED=${REST%%|*}
-  WAITING=${REST#*|}
-  [ -n "$BODY" ] || exit 0
-
-  if [ "$EVENT" = "end" ]; then
-    # SessionEnd closes what the turns reported (R-12.25). Only an
-    # interactive sitting: a fired run's Stop already posted its close,
-    # and a second close here would be answered 409 — or, worse, paired
-    # with another run's open sitting, since this run's is gone.
-    [ "$MODE" = "interactive" ] || exit 0
-    [ -n "$SITTING" ] || exit 0
-    [ "$CLOSED" = "0" ] || exit 0
-    post_report "$WAYMARK_SEAT_URL" "$BODY"
-    exit 0
-  fi
-
-  # An interactive turn, and a fired run still waiting on an agent it
-  # launched, reported above; the close is their last event's.
-  if [ "$MODE" = "interactive" ] || [ "$WAITING" = "1" ]; then
-    exit 0
-  fi
-
-  # A fired run (or a session that never sat, or one that sat before the
-  # mode existed): today's behavior, unchanged.
-  post_report "$WAYMARK_SEAT_URL" "$BODY"
-  exit 0
-fi
-
-# Path two: no door in the environment.
+# The close (R-22.7 leaves this one path).
 [ "$EVENT" = "end" ] && exit 0   # nothing to post, and SessionEnd cannot block
 
 # A fired run closes its own sitting (R-12.17): the sit answered the
