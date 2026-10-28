@@ -22,8 +22,16 @@
 # hook reads it out of the transcript rather than being told.
 #
 # Argument: "end" for the SessionEnd entry; "close-run" for a close
-# from outside the run (see below: localfire calls it); anything else
-# (the Stop entry passes nothing) is the Stop event.
+# from outside the run (see below: localfire calls it); "progress" for
+# the PostToolUse entry (see below); anything else (the Stop entry
+# passes nothing) is the Stop event.
+#
+# "progress" is how a FIRED run leaves its spend on the ledger before
+# its last Stop: a Routine's run is one turn from fire to finish, so a
+# run that dies mid-turn would otherwise have uploaded nothing and
+# reported nothing (docs/spec-spend.md §4). It uploads the new lines and
+# reports the counts so far, at most once a minute, detached, so no tool
+# call waits on curl. It never closes and prints nothing on stdout.
 #
 # One way to close (R-22.7): a FIRED session closes its sitting with the
 # transcript key its sit answered, and an INTERACTIVE one is left to the
@@ -35,6 +43,23 @@ set -u
 EVENT="${1:-stop}"
 
 HOOK=$(cat)   # the hook's JSON, on stdin. Every step below reads it.
+
+# A progress event does its work at most once every PROGRESS_SECONDS,
+# by a stamp file beside the transcript; every other one returns here,
+# before any program starts. The stamp is written before the work, so
+# two tool calls a second apart do not both post.
+PROGRESS_SECONDS=60
+if [ "$EVENT" = "progress" ]; then
+  path_re='"transcript_path"[[:space:]]*:[[:space:]]*"([^"]+)"'
+  [[ $HOOK =~ $path_re ]] || exit 0
+  STAMP="${BASH_REMATCH[1]}.waymark-progress"
+  NOW=${EPOCHSECONDS:-$(date +%s)}
+  LAST=0
+  [ -r "$STAMP" ] && read -r LAST < "$STAMP"
+  case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
+  [ $((NOW - LAST)) -ge "$PROGRESS_SECONDS" ] || exit 0
+  printf '%s\n' "$NOW" 2>/dev/null > "$STAMP" || exit 0
+fi
 
 # THE TRANSCRIPT GOES FIRST (docs/spec-transcript.md § 6). The sit
 # answers an address and a key for this sitting's transcript, beside the
@@ -259,7 +284,11 @@ try:
 except Exception:
     pass
 PY
-printf '%s' "$HOOK" | python3 -c "$UPLOAD" >/dev/null || true
+upload_transcript() {
+  printf '%s' "$HOOK" | python3 -c "$UPLOAD" >/dev/null || true
+}
+# a progress event uploads below, detached, beside its usage report
+[ "$EVENT" = "progress" ] || upload_transcript
 
 # The program sums the transcript. Its argument is the path: "post"
 # prints the door's body; "usage", "close-run" and "direct" print a
@@ -540,6 +569,14 @@ report_usage() {
   esac
   return 0
 }
+
+# A progress event (PostToolUse) that passed the stamp: the upload and
+# the report, in that order, detached from the tool call with every
+# descriptor let go, so the harness waits on neither. Never the close.
+if [ "$EVENT" = "progress" ]; then
+  ( upload_transcript; report_usage ) </dev/null >/dev/null 2>&1 &
+  exit 0
+fi
 report_usage
 
 # The close (R-22.7 leaves this one path).
